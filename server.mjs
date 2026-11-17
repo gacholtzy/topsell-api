@@ -23,6 +23,8 @@ if (fs.existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
 const PORT = Number(process.env.PORT || 8080);
 const BITESHIP_KEY = process.env.BITESHIP_API_KEY || "";
 const WOO = process.env.WOO_URL || "https://www.topsellbelanja.com/wp-json/wc/store/v1";
+const DOCS_USER = process.env.DOCS_USER || "topsell";
+const DOCS_PASSWORD = process.env.DOCS_PASSWORD || "topsell2026";
 export const OTP_CODE = "1234"; // frontend memakai OTP 4 digit
 
 // ---------------------------------------------------------------- database (Postgres)
@@ -1014,7 +1016,33 @@ const routes = [
   }],
 ];
 
-// Dokumentasi API (Scalar) di /docs, spesifikasinya di /openapi.yaml.
+const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest();
+
+function checkDocsAuth(req, res) {
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Basic ")) {
+    const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+    const sep = decoded.indexOf(":");
+    if (sep !== -1) {
+      const user = decoded.slice(0, sep);
+      const pass = decoded.slice(sep + 1);
+      if (
+        crypto.timingSafeEqual(sha256(user), sha256(DOCS_USER)) &&
+        crypto.timingSafeEqual(sha256(pass), sha256(DOCS_PASSWORD))
+      ) {
+        return true;
+      }
+    }
+  }
+  res.writeHead(401, {
+    "WWW-Authenticate": 'Basic realm="Topsell API Docs"',
+    "Content-Type": "text/plain; charset=utf-8",
+  });
+  res.end("Unauthorized");
+  return false;
+}
+
+// Dokumentasi API (Scalar) di /docs, spesifikasinya di /docs/openapi.yaml (dan /openapi.yaml).
 const DOCS_HTML = `<!doctype html>
 <html lang="id">
 <head>
@@ -1025,7 +1053,7 @@ const DOCS_HTML = `<!doctype html>
 <body>
   <div id="app"></div>
   <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.76.0"></script>
-  <script>Scalar.createApiReference('#app', { url: '/openapi.yaml', theme: 'default', hideClientButton: false })</script>
+  <script>Scalar.createApiReference('#app', { url: '/docs/openapi.yaml', theme: 'default', hideClientButton: false })</script>
 </body>
 </html>`;
 const OPENAPI_FILE = new URL("./openapi.yaml", import.meta.url);
@@ -1033,10 +1061,12 @@ const OPENAPI_FILE = new URL("./openapi.yaml", import.meta.url);
 export const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   if (req.method === "GET" && (url.pathname === "/docs" || url.pathname === "/docs/")) {
+    if (!checkDocsAuth(req, res)) return;
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     return res.end(DOCS_HTML);
   }
-  if (req.method === "GET" && url.pathname === "/openapi.yaml") {
+  if (req.method === "GET" && (url.pathname === "/docs/openapi.yaml" || url.pathname === "/openapi.yaml")) {
+    if (!checkDocsAuth(req, res)) return;
     res.writeHead(200, { "Content-Type": "application/yaml; charset=utf-8" });
     return res.end(fs.readFileSync(OPENAPI_FILE)); // dibaca tiap request: edit spec langsung terlihat
   }
