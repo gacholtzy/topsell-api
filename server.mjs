@@ -61,7 +61,9 @@ const clientIp = (req) =>
 
 // ---------------------------------------------------------------- database (Postgres)
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL belum diisi di .env");
-export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+// keepAlive + idle lebih lama: koneksi ke Neon tidak ditutup di sela permintaan, jadi permintaan berikutnya
+// tidak membayar ulang TLS + autentikasi (yang pernah membuat satu permintaan makan 650 ms).
+export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5, keepAlive: true, idleTimeoutMillis: 60000 });
 const q = async (sql, params) => (await pool.query(sql, params)).rows;
 
 const otpFailCount = async (key) =>
@@ -289,14 +291,20 @@ const VOUCHERS = [
 const wooCache = new Map(); // ponytail: cache tanpa kedaluwarsa, restart server untuk menyegarkan
 const WOO_V3 = WOO_AUTH ? `${new URL(WOO).origin}/wp-json/wc/v3` : "";
 const WOO_HEADERS = WOO_AUTH ? { Authorization: "Basic " + Buffer.from(`${WOO_KEY}:${WOO_SECRET}`).toString("base64") } : {};
+const wooInflight = new Map(); // permintaan yang sedang berjalan: dua pemanggil untuk path yang sama berbagi satu fetch
 async function woo(path) {
   if (wooCache.has(path)) return wooCache.get(path);
-  const res = await fetch(`${WOO_AUTH ? WOO_V3 : WOO}${path}`, { headers: WOO_HEADERS, signal: AbortSignal.timeout(15000) });
-  // Pesan error hanya memuat path, tidak pernah URL/kredensial.
-  if (!res.ok) throw new HttpError(502, `WooCommerce ${res.status} untuk ${path}`);
-  const json = await res.json();
-  wooCache.set(path, json);
-  return json;
+  if (wooInflight.has(path)) return wooInflight.get(path);
+  const run = (async () => {
+    const res = await fetch(`${WOO_AUTH ? WOO_V3 : WOO}${path}`, { headers: WOO_HEADERS, signal: AbortSignal.timeout(15000) });
+    // Pesan error hanya memuat path, tidak pernah URL/kredensial.
+    if (!res.ok) throw new HttpError(502, `WooCommerce ${res.status} untuk ${path}`);
+    const json = await res.json();
+    wooCache.set(path, json);
+    return json;
+  })().finally(() => wooInflight.delete(path));
+  wooInflight.set(path, run);
+  return run;
 }
 
 // Satu bentuk untuk dua sumber (Store API / REST v3). original = harga coret, current = harga jual.
@@ -337,8 +345,11 @@ async function loadProduct(productId, variationId) {
   // Titik terakhir sebelum URL ke WooCommerce dibentuk: semua pemanggil lewat sini.
   productId = idOf(productId, "productId");
   variationId = variationId ? idOf(variationId, "variationId") : "";
-  const p = await woo(`/products/${productId}`);
-  const v = variationId ? await woo(WOO_AUTH ? `/products/${productId}/variations/${variationId}` : `/products/${variationId}`) : null;
+  // Produk dan variasinya tidak saling bergantung: diambil bersamaan (sebelumnya berurutan).
+  const [p, v] = await Promise.all([
+    woo(`/products/${productId}`),
+    variationId ? woo(WOO_AUTH ? `/products/${productId}/variations/${variationId}` : `/products/${variationId}`) : null,
+  ]);
   // REST v3 juga mengembalikan draft/private; hanya yang publish boleh dijual (seperti Store API).
   if (WOO_AUTH && p.status !== "publish") throw new HttpError(502, `WooCommerce 404 untuk /products/${productId}`);
   if (WOO_AUTH && v && v.status !== "publish") throw new HttpError(502, `WooCommerce 404 untuk /products/${productId}/variations/${variationId}`);
