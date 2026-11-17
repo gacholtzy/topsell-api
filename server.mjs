@@ -317,8 +317,26 @@ class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+// ---------------------------------------------------------------- validasi masukan
+const MAX_QTY = 1000;
+/** ID produk/variasi: hanya digit. Nilai lain (mis. "1/../x") tidak boleh ikut membentuk URL ke WooCommerce. */
+const idOf = (v, label = "id") => {
+  const s = String(v ?? "");
+  if (!/^\d{1,12}$/.test(s)) throw new HttpError(400, `${label} tidak valid`);
+  return s;
+};
+/** Bilangan bulat dalam rentang; selain itu 400 (bukan 500 dari database, bukan angka negatif/pecahan ke harga). */
+const intOf = (v, min, max, label = "qty") => {
+  const n = typeof v === "string" && /^-?\d{1,9}$/.test(v) ? Number(v) : v;
+  if (!Number.isInteger(n) || n < min || n > max) throw new HttpError(400, `${label} harus bilangan bulat ${min}-${max}`);
+  return n;
+};
+
 /** Produk dalam bentuk yang dibaca frontend. price = harga coret, regularPrice = harga jual. */
 async function loadProduct(productId, variationId) {
+  // Titik terakhir sebelum URL ke WooCommerce dibentuk: semua pemanggil lewat sini.
+  productId = idOf(productId, "productId");
+  variationId = variationId ? idOf(variationId, "variationId") : "";
   const p = await woo(`/products/${productId}`);
   const v = variationId ? await woo(WOO_AUTH ? `/products/${productId}/variations/${variationId}` : `/products/${variationId}`) : null;
   // REST v3 juga mengembalikan draft/private; hanya yang publish boleh dijual (seperti Store API).
@@ -388,7 +406,9 @@ async function linesFromBody(user, data) {
     const id = d.id || d.cartID;
     const row = cart.find((r) => r.id === id);
     if (!row) continue;
-    const qty = d.qty && d.qty < row.qty ? d.qty : row.qty;
+    // Klien hanya boleh MENURUNKAN jumlah (langkah pickup): bilangan bulat >= 1, dan tidak melebihi isi keranjang.
+    // Nilai negatif/nol/pecahan/non-angka ditolak (400); sebelumnya -2 dihitung apa adanya dan menghasilkan total negatif.
+    const qty = d.qty == null ? row.qty : Math.min(intOf(d.qty, 1, MAX_QTY), row.qty);
     lines.push({ row, qty, product: await loadProduct(row.productId, row.variationId) });
   }
   return lines;
@@ -541,6 +561,15 @@ async function bookShipment(order) {
     trackingNumber: data.courier.waybill_id || "",
     trackingUrl: `/tracking/${order.invoice}`,
   };
+}
+/** Item untuk tarif ongkir dari body publik (tanpa login): ID/qty divalidasi, jumlah item dibatasi. */
+async function rateItemsFromBody(b) {
+  const list = Array.isArray(b?.product_ids_and_quantities) ? b.product_ids_and_quantities : [];
+  if (list.length > 50) throw new HttpError(400, "terlalu banyak item");
+  return Promise.all(list.map(async (i) => {
+    const p = await loadProduct(i?.id, i?.variationId);
+    return { name: p.name, value: p.regularPrice, qty: i.quantity == null ? 1 : intOf(i.quantity, 1, MAX_QTY, "quantity") };
+  }));
 }
 const rateItems = (lines) => lines.map((l) => ({ name: l.product.name, value: l.product.regularPrice, qty: l.qty }));
 
@@ -723,19 +752,17 @@ const routes = [
   ["POST", /^\/carts\/items$/, async (req, res) => {
     const user = await authUser(req);
     const b = await readBody(req);
-    const productId = String(b.productId || "");
-    const variationId = String(b.variationId || "");
-    const qty = Number(b.qty) || 1;
-    if (!productId) throw new HttpError(400, "productId wajib diisi");
-    if (!(qty >= 1)) throw new HttpError(400, "qty minimal 1");
+    const productId = idOf(b.productId, "productId");
+    const variationId = b.variationId ? idOf(b.variationId, "variationId") : "";
+    const qty = b.qty == null ? 1 : intOf(b.qty, 1, MAX_QTY);
     await loadProduct(productId, variationId); // produk yang tidak ada -> 502, seperti backend asli
-    // Produk + variasi yang sama ditambah qty-nya, bukan baris baru (atomic di database).
+    // Produk + variasi yang sama ditambah qty-nya, bukan baris baru (atomic di database); dibatasi MAX_QTY.
     const [row] = await q(
       `insert into cart_items (user_id, product_id, variation_id, qty) values ($1, $2, $3, $4)
        on conflict (user_id, product_id, variation_id)
-       do update set qty = cart_items.qty + excluded.qty, updated_at = now()
+       do update set qty = least(cart_items.qty + excluded.qty, $5), updated_at = now()
        returning ${CART_COLS}`,
-      [user.id, productId, variationId, qty]
+      [user.id, productId, variationId, qty, MAX_QTY]
     );
     send(res, 200, { status: 201, message: "Item added to cart successfully", data: { ...row, userId: user.id } });
   }],
@@ -747,8 +774,7 @@ const routes = [
   ["PUT", /^\/carts\/items\/([\w-]+)$/, async (req, res, m) => {
     const user = await authUser(req);
     await getCartItem(user.id, m[1]);
-    const qty = Number((await readBody(req)).qty);
-    if (!(qty >= 1)) throw new HttpError(400, "qty minimal 1");
+    const qty = intOf((await readBody(req)).qty, 1, MAX_QTY);
     const [row] = await q(
       `update cart_items set qty = $1, updated_at = now() where id = $2 returning ${CART_COLS}`, [qty, m[1]]
     );
@@ -817,21 +843,11 @@ const routes = [
   // --- ongkir
   ["GET", /^\/shippings\/methods$/, (req, res) => ok(res, SHIPPING_METHODS)],
   ["POST", /^\/shippings\/price$/, async (req, res, m, url) => {
-    const b = await readBody(req);
-    const items = await Promise.all((b.product_ids_and_quantities || []).map(async (i) => {
-      const p = await loadProduct(i.id, i.variationId);
-      return { name: p.name, value: p.regularPrice, qty: Number(i.quantity) || 1 };
-    }));
-    ok(res, await shippingCost(url.searchParams.get("postal_code"), null, items));
+    ok(res, await shippingCost(url.searchParams.get("postal_code"), null, await rateItemsFromBody(await readBody(req))));
   }],
   // Pemilih kurir (components/courier-options.tsx): semua layanan, termurah dulu.
   ["POST", /^\/shippings\/options$/, async (req, res, m, url) => {
-    const b = await readBody(req);
-    const items = await Promise.all((b.product_ids_and_quantities || []).map(async (i) => {
-      const p = await loadProduct(i.id, i.variationId);
-      return { name: p.name, value: p.regularPrice, qty: Number(i.quantity) || 1 };
-    }));
-    ok(res, await shippingOptions(url.searchParams.get("postal_code"), items));
+    ok(res, await shippingOptions(url.searchParams.get("postal_code"), await rateItemsFromBody(await readBody(req))));
   }],
 
   // --- voucher
@@ -876,7 +892,9 @@ const routes = [
     const adminFee = paymentMethod.adminFeeType === "percentage"
       ? Math.round((paymentMethod.adminFee / 100) * (subtotal + ongkir)) : paymentMethod.adminFee;
 
-    const invoice = `INV-LOCAL-${Date.now().toString(36).toUpperCase()}`;
+    // Acak 64 bit: invoice berperan sebagai "kata sandi" untuk GET /orders (halaman /manual dan /thankyou
+    // memanggilnya tanpa login), jadi tidak boleh dapat diturunkan dari waktu pembuatan.
+    const invoice = `INV-LOCAL-${crypto.randomBytes(8).toString("hex").toUpperCase()}`;
     const order = {
       id: crypto.randomUUID(), invoice, userId: user.id,
       name: b.name, email: b.email, phone: b.phone, address: b.address,

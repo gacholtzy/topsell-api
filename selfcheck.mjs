@@ -53,6 +53,35 @@ try {
   const sda = await call("GET", `/carts/stock?storeId=store-sda&itemIds=${item.id}&qtys=2`);
   assert.equal(sda.data.canCheckout, item.stock > 0);
 
+  // ===== regresi audit F-01: qty tidak valid ditolak (400), keranjang tidak berubah =====
+  const pickupBody = { address: "-", city: "Sidoarjo", postalCode: "61219", name: "Tes", email: "t@x.id", phone,
+    shippingID: "3", areaID: "store-sda", paymentMethodID: "pm-manual" }; // Ambil di Toko: tidak memanggil Biteship
+  for (const bad of [-2, 0, 0.5, "abc", "2.5", true, [], 1e9]) {
+    assert.equal((await call("POST", "/checkout", { ...pickupBody, cartItems: [{ id: item.id, qty: bad }] })).http, 400,
+      `checkout qty=${JSON.stringify(bad)} harus 400`);
+    assert.equal((await call("POST", "/vouchers/validate?voucherID=v-hemat10",
+      { data: [{ id: item.id, qty: bad }], shippingID: "3" })).http, 400, `voucher qty=${JSON.stringify(bad)} harus 400`);
+  }
+  assert.equal((await call("GET", "/carts")).data.items[0].qty, 2, "qty tidak valid tidak mengubah keranjang");
+  // F-01: qty keranjang (tambah/ubah) juga harus bilangan bulat 1..1000
+  for (const bad of [-1, 0, 1.5, "x", 1001]) {
+    assert.equal((await call("POST", "/carts/items", { productId: "271593", qty: bad })).http, 400, `tambah qty=${bad}`);
+    assert.equal((await call("PUT", `/carts/items/${item.id}`, { qty: bad })).http, 400, `ubah qty=${bad}`);
+  }
+  // ===== regresi audit F-03: ID bukan digit tidak boleh sampai ke URL WooCommerce =====
+  for (const badId of ["1/../x", "271593?a=1", "../1", "271593#", "1 2", "", "9".repeat(13)]) {
+    assert.equal((await call("POST", "/carts/items", { productId: badId, qty: 1 })).http, 400, `productId=${badId}`);
+  }
+  assert.equal((await call("POST", "/carts/items", { productId: "271593", variationId: "1/../x", qty: 1 })).http, 400, "variationId");
+  const anon = (p, body) => fetch(`${base}${p}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.status);
+  // tanpa login: endpoint ongkir publik
+  const goodItem = { id: "271593", quantity: 1, variationId: "" };
+  for (const bad of [{ ...goodItem, id: "1/../../x" }, { ...goodItem, variationId: "1/../x" }, { ...goodItem, quantity: -1 }, { ...goodItem, quantity: 0.5 }]) {
+    assert.equal(await anon("/shippings/options?postal_code=63352", { product_ids_and_quantities: [bad] }), 400, JSON.stringify(bad));
+    assert.equal(await anon("/shippings/price?postal_code=63352", { product_ids_and_quantities: [bad] }), 400, JSON.stringify(bad));
+  }
+  assert.equal(await anon("/shippings/options?postal_code=63352", { product_ids_and_quantities: Array(51).fill(goodItem) }), 400, "maks. 50 item");
+
   // area & ongkir
   assert.equal((await call("GET", "/topsell-area-postal/check-postal-code-is-exist/61219")).data, true);
   // Ongkir luar area: Biteship bila ada key, Rp20.000 bila tidak. Dibaca dulu, dipakai di hitungan bawah.
@@ -73,6 +102,9 @@ try {
   assert.equal(list.data.find((v) => v.id === "v-pickup25").isEligible, false);
   const ship = await call("POST", "/vouchers/validate?voucherID=v-ongkir", vbody);
   assert.equal(ship.data, Math.min(20000, ongkir2));
+  // qty melebihi isi keranjang dibatasi ke isi keranjang (tidak pernah menambah)
+  assert.equal((await call("POST", "/vouchers/validate?voucherID=v-hemat10", { ...vbody, data: [{ id: item.id, qty: 999 }] })).data, v10.data,
+    "qty > isi keranjang dibatasi ke isi keranjang");
 
   // checkout 1 dari 2 unit, transfer manual, luar area
   // pilihan kurir (kontrak tim): luar area bayar penuh, area Topsell disubsidi jadi 0
@@ -105,6 +137,15 @@ try {
   });
   assert.equal(co.http, 200);
   assert.match(co.redirectURL, /^\/manual\?inv=INV-LOCAL-/);
+  // ===== regresi audit F-02: invoice acak 64 bit, tidak dapat diturunkan dari waktu =====
+  assert.match(co.data.invoice, /^INV-LOCAL-[0-9A-F]{16}$/);
+  const created = Date.parse(co.data.createdAt);
+  for (let t = created - 50; t <= created + 50; t++) {
+    const guess = `INV-LOCAL-${t.toString(36).toUpperCase()}`;
+    const r = await fetch(`${base}/orders?invoice=${guess}`); // tanpa Authorization
+    assert.equal(r.status, 404, `invoice berbasis waktu ${guess} tidak boleh ada`);
+  }
+  assert.equal((await fetch(`${base}/orders?invoice=${co.data.invoice}`)).status, 200, "pemilik invoice yang benar tetap bisa membuka halaman pesanan");
   const unit = row.data.regularPrice;
   assert.equal(co.data.ongkir, ongkir1);
   assert.equal(co.data.total, unit + ongkir1 - Math.min(Math.round(unit * 0.1), 50000) - Math.min(20000, ongkir1));
