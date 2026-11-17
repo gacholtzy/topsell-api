@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "functions": {
+    "server.mjs": {
+      "includeFiles": "openapi.yaml"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/server.mjs"
+    }
+  ]
+}
