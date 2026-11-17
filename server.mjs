@@ -23,6 +23,12 @@ if (fs.existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
 const PORT = Number(process.env.PORT || 8080);
 const BITESHIP_KEY = process.env.BITESHIP_API_KEY || "";
 const WOO = process.env.WOO_URL || "https://www.topsellbelanja.com/wp-json/wc/store/v1";
+// Tanpa key: Store API publik (hanya produk yang tampil di katalog; di sebagian situs rutenya error 500).
+// Dengan WOO_CONSUMER_KEY + WOO_CONSUMER_SECRET (WooCommerce > Settings > Advanced > REST API, izin Read):
+// REST API v3 — juga membaca produk yang disembunyikan dari katalog, tapi hanya yang berstatus publish.
+const WOO_KEY = process.env.WOO_CONSUMER_KEY || "";
+const WOO_SECRET = process.env.WOO_CONSUMER_SECRET || "";
+const WOO_AUTH = !!(WOO_KEY && WOO_SECRET);
 
 // ---------------------------------------------------------------- mode & pengaman
 // AMAN SECARA DEFAULT. Fitur tes hanya hidup dengan DEV_MODE=true (laptop sendiri):
@@ -281,14 +287,31 @@ const VOUCHERS = [
 
 // ---------------------------------------------------------------- WooCommerce (data produk asli)
 const wooCache = new Map(); // ponytail: cache tanpa kedaluwarsa, restart server untuk menyegarkan
+const WOO_V3 = WOO_AUTH ? `${new URL(WOO).origin}/wp-json/wc/v3` : "";
+const WOO_HEADERS = WOO_AUTH ? { Authorization: "Basic " + Buffer.from(`${WOO_KEY}:${WOO_SECRET}`).toString("base64") } : {};
 async function woo(path) {
   if (wooCache.has(path)) return wooCache.get(path);
-  const res = await fetch(`${WOO}${path}`, { signal: AbortSignal.timeout(15000) });
+  const res = await fetch(`${WOO_AUTH ? WOO_V3 : WOO}${path}`, { headers: WOO_HEADERS, signal: AbortSignal.timeout(15000) });
+  // Pesan error hanya memuat path, tidak pernah URL/kredensial.
   if (!res.ok) throw new HttpError(502, `WooCommerce ${res.status} untuk ${path}`);
   const json = await res.json();
   wooCache.set(path, json);
   return json;
 }
+
+// Satu bentuk untuk dua sumber (Store API / REST v3). original = harga coret, current = harga jual.
+function wooPrices(src) {
+  if (WOO_AUTH) {
+    const current = Number(src.price) || 0;
+    return { original: Number(src.regular_price) || current, current };
+  }
+  return { original: Number(src.prices.regular_price), current: Number(src.prices.price) };
+}
+const wooInStock = (src) => (WOO_AUTH ? src.stock_status !== "outofstock" : !!src.is_in_stock);
+const wooVariationLabel = (v) =>
+  WOO_AUTH
+    ? (v.attributes || []).map((a) => a.option).filter(Boolean).join(", ")
+    : String(v.variation || "").split(":").pop().trim();
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -297,20 +320,24 @@ class HttpError extends Error {
 /** Produk dalam bentuk yang dibaca frontend. price = harga coret, regularPrice = harga jual. */
 async function loadProduct(productId, variationId) {
   const p = await woo(`/products/${productId}`);
-  const v = variationId ? await woo(`/products/${variationId}`) : null;
+  const v = variationId ? await woo(WOO_AUTH ? `/products/${productId}/variations/${variationId}` : `/products/${variationId}`) : null;
+  // REST v3 juga mengembalikan draft/private; hanya yang publish boleh dijual (seperti Store API).
+  if (WOO_AUTH && p.status !== "publish") throw new HttpError(502, `WooCommerce 404 untuk /products/${productId}`);
+  if (WOO_AUTH && v && v.status !== "publish") throw new HttpError(502, `WooCommerce 404 untuk /products/${productId}/variations/${variationId}`);
   const src = v || p;
+  const { original, current } = wooPrices(src);
   return {
     id: String(p.id),
     name: p.name,
     slug: p.slug,
-    price: Number(src.prices.regular_price),
-    regularPrice: Number(src.prices.price),
+    price: original,
+    regularPrice: current,
     categories: (p.categories || []).map((c) => ({ id: String(c.id), name: c.name })),
     images: (p.images || []).map((i) => ({ id: String(i.id), name: i.name, src: i.src, alt: i.alt })),
-    variationName: v ? String(v.variation || "").split(":").pop().trim() : "",
+    variationName: v ? wooVariationLabel(v) : "",
     variationId: v ? String(v.id) : "",
     sku: src.sku || "",
-    inStock: !!src.is_in_stock,
+    inStock: wooInStock(src),
   };
 }
 
@@ -628,11 +655,14 @@ const routes = [
     ok(res, variationId ? { ...p, name: p.variationName } : p);
   }],
   ["GET", /^\/(carts\/)?recommendations$/, async (req, res) => {
-    const list = await woo("/products?per_page=8");
-    ok(res, list.map((p) => ({
-      thumbnail: p.images?.[0]?.src || "", slug: p.slug, name: p.name,
-      price: p.prices.regular_price, regularPrice: p.prices.price,
-    })));
+    // REST v3 membawa produk yang disembunyikan dari katalog; rekomendasi hanya menampilkan yang tampil.
+    const list = WOO_AUTH
+      ? (await woo("/products?per_page=12&status=publish")).filter((p) => p.catalog_visibility === "visible" || p.catalog_visibility === "catalog").slice(0, 8)
+      : await woo("/products?per_page=8");
+    ok(res, list.map((p) => {
+      const { original, current } = wooPrices(p);
+      return { thumbnail: p.images?.[0]?.src || "", slug: p.slug, name: p.name, price: String(original), regularPrice: String(current) };
+    }));
   }],
 
   // --- user / login OTP
