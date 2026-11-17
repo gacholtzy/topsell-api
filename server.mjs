@@ -23,14 +23,53 @@ if (fs.existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
 const PORT = Number(process.env.PORT || 8080);
 const BITESHIP_KEY = process.env.BITESHIP_API_KEY || "";
 const WOO = process.env.WOO_URL || "https://www.topsellbelanja.com/wp-json/wc/store/v1";
+
+// ---------------------------------------------------------------- mode & pengaman
+// AMAN SECARA DEFAULT. Fitur tes hanya hidup dengan DEV_MODE=true (laptop sendiri):
+//   - OTP tetap 1234 dan ditampilkan di respons
+//   - endpoint /dev/* (ubah status pesanan tanpa login)
+//   - /docs terbuka tanpa password
+// Di Vercel / server yang bisa diakses orang lain DEV_MODE harus mati dan OTP_CODE wajib diisi.
+const DEV_MODE = process.env.DEV_MODE === "true";
+export const OTP_CODE = process.env.OTP_CODE || (DEV_MODE ? "1234" : ""); // frontend memakai OTP 4 digit
+const WEAK_OTPS = new Set(["1234", "0000", "1111", "2222", "3333", "4321", "1212", "1122"]);
+if (!DEV_MODE && (!/^\d{4}$/.test(OTP_CODE) || WEAK_OTPS.has(OTP_CODE))) {
+  throw new Error(
+    "DEV_MODE mati: isi OTP_CODE dengan 4 digit yang tidak mudah ditebak (bukan 1234/0000/dst). " +
+    "Untuk tes di laptop sendiri, set DEV_MODE=true."
+  );
+}
 const DOCS_USER = process.env.DOCS_USER || "topsell";
-const DOCS_PASSWORD = process.env.DOCS_PASSWORD || "topsell2026";
-export const OTP_CODE = "1234"; // frontend memakai OTP 4 digit
+// Tanpa nilai bawaan: password di kode ikut masuk riwayat git. Kosong di luar DEV_MODE = /docs mati (404).
+const DOCS_PASSWORD = process.env.DOCS_PASSWORD || "";
+const TRUST_PROXY = process.env.TRUST_PROXY === "true" || !!process.env.VERCEL; // Vercel selalu di belakang proxy
+const otpMessage = () => (DEV_MODE ? `OTP terkirim (lokal: ${OTP_CODE})` : "OTP terkirim");
+
+// Batasi tebakan OTP: OTP-nya satu kode bersama, jadi percobaan salah dihitung per nomor dan per alamat IP.
+// Disimpan di database (tabel otp_attempts), bukan di memori: di Vercel tiap instance/cold start mulai dari nol.
+const OTP_WINDOW_SECONDS = 15 * 60;
+const OTP_MAX_PER_PHONE = 5;
+const OTP_MAX_PER_IP = 20;
+const clientIp = (req) =>
+  (TRUST_PROXY && String(req.headers["x-forwarded-for"] || "").split(",")[0].trim()) || req.socket.remoteAddress || "?";
 
 // ---------------------------------------------------------------- database (Postgres)
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL belum diisi di .env");
 export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
 const q = async (sql, params) => (await pool.query(sql, params)).rows;
+
+const otpFailCount = async (key) =>
+  (await q(`select n from otp_attempts where key = $1 and until > now()`, [key]))[0]?.n ?? 0;
+const noteOtpFail = async (key) => {
+  await q(
+    `insert into otp_attempts (key, n, until) values ($1, 1, now() + make_interval(secs => $2))
+     on conflict (key) do update
+       set n = case when otp_attempts.until > now() then otp_attempts.n + 1 else 1 end,
+           until = now() + make_interval(secs => $2)`,
+    [key, OTP_WINDOW_SECONDS]
+  );
+  await q(`delete from otp_attempts where until < now() - interval '1 hour'`); // bersihkan yang sudah lama
+};
 
 /** Dibuat sekali saat start; aman dijalankan berulang. */
 export const dbReady = pool.query(`
@@ -79,6 +118,11 @@ export const dbReady = pool.query(`
     created_at timestamptz not null default now()
   );
   create index if not exists point_ledger_user on point_ledger (user_id, created_at desc);
+  create table if not exists otp_attempts (
+    key text primary key,            -- "phone:<nomor>" atau "ip:<alamat>"
+    n integer not null,              -- jumlah tebakan salah dalam jendela waktu
+    until timestamptz not null       -- jendela berakhir; setelah itu hitungan mulai lagi
+  );
   create table if not exists user_vouchers (
     id uuid primary key default gen_random_uuid(),
     user_id uuid not null references users(id) on delete cascade,
@@ -607,18 +651,29 @@ const routes = [
       [b.fullName, b.email || "", phoneNumber, NEW_MEMBER_POINTS]
     );
     if (!created) throw new HttpError(409, "Nomor sudah terdaftar, silakan login");
-    ok(res, null, `OTP terkirim (lokal: ${OTP_CODE})`);
+    ok(res, null, otpMessage());
   }],
   ["POST", /^\/users\/(login|resend-otp)$/, async (req, res) => {
     const phoneNumber = normPhone((await readBody(req)).phoneNumber);
     if (!(await findUserByPhone(phoneNumber))) throw new HttpError(404, "Nomor belum terdaftar, silakan daftar dulu");
-    ok(res, null, `OTP terkirim (lokal: ${OTP_CODE})`);
+    ok(res, null, otpMessage());
   }],
   ["POST", /^\/users\/verify-otp$/, async (req, res) => {
     const b = await readBody(req);
-    const user = await findUserByPhone(normPhone(b.phoneNumber));
+    const phoneNumber = normPhone(b.phoneNumber);
+    const phoneKey = `phone:${phoneNumber}`;
+    const ipKey = `ip:${clientIp(req)}`;
+    if ((await otpFailCount(phoneKey)) >= OTP_MAX_PER_PHONE || (await otpFailCount(ipKey)) >= OTP_MAX_PER_IP) {
+      throw new HttpError(429, "Terlalu banyak percobaan OTP. Coba lagi 15 menit lagi.");
+    }
+    const user = await findUserByPhone(phoneNumber);
     if (!user) throw new HttpError(404, "Nomor belum terdaftar");
-    if (String(b.otp) !== OTP_CODE) throw new HttpError(400, "Kode OTP salah");
+    if (String(b.otp) !== OTP_CODE) {
+      await noteOtpFail(phoneKey);
+      await noteOtpFail(ipKey);
+      throw new HttpError(400, "Kode OTP salah");
+    }
+    await q(`delete from otp_attempts where key = $1`, [phoneKey]);
     const token = crypto.randomBytes(24).toString("hex");
     await q(`insert into sessions (token, user_id) values ($1, $2)`, [token, user.id]);
     ok(res, { token, user }, "Login berhasil");
@@ -1003,9 +1058,10 @@ const routes = [
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, "Format email tidak valid");
     const token = crypto.randomBytes(24).toString("hex");
     await q(`update users set email = $1, email_valid = false, email_token = $2 where id = $3`, [email, token, user.id]);
-    // Email tidak dikirim di lokal: buka link ini untuk memvalidasi.
-    console.log(`  link validasi email ${email}: ${FRONTEND_URL}/profil/validate-email?token=${token}`);
-    ok(res, null, "Link validasi terkirim (lokal: lihat log server)");
+    // Email tidak dikirim: di DEV_MODE link validasinya ditulis di log server.
+    // Di luar DEV_MODE token tidak dicetak ke log (itu rahasia).
+    if (DEV_MODE) console.log(`  link validasi email ${email}: ${FRONTEND_URL}/profil/validate-email?token=${token}`);
+    ok(res, null, DEV_MODE ? "Link validasi terkirim (lokal: lihat log server)" : "Link validasi terkirim");
   }],
   ["GET", /^\/users\/validate-email$/, async (req, res, m, url) => {
     const token = url.searchParams.get("token") || "";
@@ -1019,6 +1075,13 @@ const routes = [
 const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest();
 
 function checkDocsAuth(req, res) {
+  if (!DOCS_PASSWORD) {
+    // Tanpa DOCS_PASSWORD: terbuka hanya di DEV_MODE; di luar itu halaman dianggap tidak ada.
+    if (DEV_MODE) return true;
+    res.writeHead(404);
+    res.end();
+    return false;
+  }
   const header = req.headers.authorization || "";
   if (header.startsWith("Basic ")) {
     const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
@@ -1073,8 +1136,10 @@ export const server = http.createServer(async (req, res) => {
   const path = url.pathname.replace(/^\/api\/v1/, "").replace(/\/+$/, "");
   const started = Date.now();
   try {
-    const route = routes.find(([method, re]) => method === req.method && re.test(path));
-    if (!route) throw new HttpError(404, `Endpoint lokal belum ada: ${req.method} ${url.pathname}`);
+    // /dev/* (ubah status pesanan tanpa login) hanya ada di DEV_MODE; di luar itu 404 seperti route yang tidak ada.
+    const route = (DEV_MODE || !path.startsWith("/dev/")) &&
+      routes.find(([method, re]) => method === req.method && re.test(path));
+    if (!route) throw new HttpError(404, `Endpoint tidak ditemukan: ${req.method} ${url.pathname}`);
     await route[2](req, res, path.match(route[1]), url);
   } catch (err) {
     const status = err instanceof HttpError ? err.status : 500;
@@ -1087,9 +1152,12 @@ export const server = http.createServer(async (req, res) => {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await dbReady;
-  server.listen(PORT, () => console.log(
-    `API lokal jalan di http://localhost:${PORT}/api/v1  (OTP: ${OTP_CODE}, cari alamat: ${BITESHIP_KEY ? "Biteship" : "data contoh — isi BITESHIP_API_KEY di .env"})`
-  ));
+  server.listen(PORT, () => {
+    console.log(`API jalan di http://localhost:${PORT}/api/v1  (cari alamat: ${BITESHIP_KEY ? "Biteship" : "data contoh — isi BITESHIP_API_KEY di .env"})`);
+    console.log(DEV_MODE
+      ? `  DEV_MODE AKTIF: OTP ${OTP_CODE}, /dev/* dan /docs terbuka. Jangan dibuka ke internet.`
+      : `  Mode aman: /dev/* mati, OTP dari OTP_CODE (dibatasi ${OTP_MAX_PER_PHONE}x salah/15 menit), /docs ${DOCS_PASSWORD ? "diproteksi password" : "mati"}.`);
+  });
 }
 
 // Pastikan tabel DB siap saat cold-start di Vercel, lalu teruskan request ke server

@@ -1,8 +1,11 @@
 // Self-check alur tahap 1 terhadap server lokal (butuh internet untuk data produk Woo
 // dan database di DATABASE_URL). User tes memakai nomor acak dan dihapus lagi di akhir.
 // Jalankan: node selfcheck.mjs
+// Self-check memakai /dev/* dan OTP 1234, jadi selalu berjalan di DEV_MODE (tidak mempengaruhi server lain).
+// Pengaman mode hosting dites terpisah di securitycheck.mjs.
 import assert from "node:assert/strict";
 
+process.env.DEV_MODE = "true";
 const { server, pool, dbReady, OTP_CODE } = await import("./server.mjs");
 await dbReady;
 await new Promise((r) => server.listen(0, r));

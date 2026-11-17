@@ -5,7 +5,8 @@
   "description": "API lokal tiruan untuk store-topsell-next (tahap 1: add-to-cart -> login -> keranjang -> checkout)",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node selfcheck.mjs"
+    "check": "node selfcheck.mjs && node securitycheck.mjs",
+    "check:security": "node securitycheck.mjs"
   },
   "engines": {
     "node": ">=18"

@@ -16,15 +16,14 @@ info:
     **Login:** endpoint bertanda gembok butuh header `Authorization: Bearer <token>`
     (token dari `POST /users/verify-otp`).
 
-    **API lokal:** OTP selalu `1234`, captcha diabaikan, pembayaran tidak sungguhan.
+    **API tiruan:** captcha diabaikan, pembayaran tidak sungguhan. Dengan `DEV_MODE=true` OTP-nya `1234`
+    dan endpoint "Khusus Lokal" aktif; di luar DEV_MODE (hosting) OTP dari `OTP_CODE` dan endpoint itu mati (404).
     Produk asli dari WooCommerce, alamat/ongkir/tracking dari Biteship (sandbox), data di Postgres.
 servers:
   - url: /api/v1
     description: Server Saat Ini (Vercel / Lokal)
   - url: http://localhost:8080/api/v1
     description: API lokal (topsell-local-api)
-  - url: https://api.topsellbelanja.com/api/v1
-    description: Produksi
 tags:
   - name: Pengaturan
   - name: Produk
