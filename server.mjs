@@ -15,6 +15,17 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
 import pg from "pg";
+import {
+  buildAdminRoutes,
+  ensureAdminSchema,
+  getActivePaymentGroups,
+  getActivePointCatalog,
+  getActiveStores,
+  getActiveVouchers,
+  getAppSettingsMap,
+  isTopsellPostalDb,
+  triggerWebhooks,
+} from "./admin.mjs";
 
 // .env di folder ini (opsional), mis. BITESHIP_API_KEY=biteship_test...
 const ENV_FILE = new URL("./.env", import.meta.url);
@@ -147,7 +158,7 @@ export const dbReady = pool.query(`
   insert into point_ledger (user_id, type, amount, balance_after, description)
     select u.id, 'earn', u.points, u.points, 'Bonus member baru' from users u
     where u.points > 0 and not exists (select 1 from point_ledger p where p.user_id = u.id);
-`);
+`).then(() => ensureAdminSchema(pool));
 
 /** Jalankan fn(client) dalam satu transaksi; gagal di tengah = tidak ada yang berubah. */
 async function tx(fn) {
@@ -465,7 +476,7 @@ async function shippingOptions(postalCode, items) {
     }
     list = rateCache.get(body);
   }
-  const free = isTopsellPostal(postalCode);
+  const free = await isTopsellPostalDb(q, postalCode);
   return list
     .map((o) => ({ ...o, price: free ? 0 : o.listPrice, freeArea: free }))
     .sort((a, b) => a.price - b.price || a.listPrice - b.listPrice);
@@ -603,10 +614,11 @@ const myVouchers = async (userId) => (await q(
   `select * from user_vouchers where user_id = $1 and used_at is null and end_date > now() order by created_at desc`,
   [userId]
 )).map(userVoucherView);
-/** Voucher global atau voucher milik user ini yang belum dipakai. */
+/** Voucher global (Postgres) atau voucher milik user ini yang belum dipakai. */
 async function findVoucher(userId, id) {
   if (!id) return null;
-  return VOUCHERS.find((v) => v.id === id)
+  const activeVouchers = await getActiveVouchers(q);
+  return activeVouchers.find((v) => v.id === id)
     || (isUuid(id) && (await myVouchers(userId)).find((v) => v.id === id))
     || null;
 }
@@ -635,9 +647,9 @@ function orderView(row) {
   return o;
 }
 
-function voucherList(type, subtotal, shippingID, extra = []) {
+function voucherList(type, subtotal, shippingID, globalVouchers = [], extra = []) {
   const isPickup = shippingID === PICKUP_ID;
-  return [...VOUCHERS, ...extra]
+  return [...globalVouchers, ...extra]
     .filter((v) => (type === "shipping") === (v.type === "shipping"))
     .map((v) => {
       const fits = v.fulfillmentType === "all" || (v.fulfillmentType === "pickup") === isPickup;
@@ -648,8 +660,8 @@ function voucherList(type, subtotal, shippingID, extra = []) {
 }
 
 /** Stok satu cabang untuk baris keranjang. storeIndex -1 = gudang online. */
-function branchStock(storeIndex, rows) {
-  const store = STORES[storeIndex];
+function branchStock(storeIndex, rows, storeList = STORES) {
+  const store = storeList[storeIndex];
   const items = rows.map(({ row, qty, product }) => {
     const h = hash(row.productId + (row.variationId || ""));
     const available = !product.inStock ? 0 : storeIndex < 0 ? 99 : [10, h % 3, 0][storeIndex] ?? 0;
@@ -684,8 +696,18 @@ async function stockRows(user, url) {
 // ---------------------------------------------------------------- routes
 // [method, regex atas path setelah /api/v1, handler(req, res, match, url)]
 const routes = [
-  ["GET", /^\/app-settings$/, (req, res) =>
-    ok(res, { id: "local", banner_imager: [], meta_your_pixel: "", body_script: "" })],
+  ["GET", /^\/app-settings$/, async (req, res) => {
+    const map = await getAppSettingsMap(q);
+    const app = map.app_settings || {};
+    ok(res, {
+      id: "local",
+      banner_imager: app.banner_imager || [],
+      meta_your_pixel: app.meta_your_pixel || "",
+      body_script: app.body_script || "",
+      store_name: app.store_name || "Topsell Belanja",
+      support_whatsapp: app.support_whatsapp || "",
+    });
+  }],
 
   // --- produk
   ["GET", /^\/products\/(\d+)$/, async (req, res, m, url) => {
@@ -801,14 +823,16 @@ const routes = [
   ["GET", /^\/carts\/stock$/, async (req, res, m, url) => {
     const rows = await stockRows(await authUser(req), url);
     const storeId = url.searchParams.get("storeId");
-    const idx = storeId ? STORES.findIndex((s) => s.id === storeId) : -1;
+    const stores = await getActiveStores(q);
+    const idx = storeId ? stores.findIndex((s) => s.id === storeId) : -1;
     if (storeId && idx < 0) throw new HttpError(404, "Toko tidak ditemukan");
-    ok(res, branchStock(idx, rows));
+    ok(res, branchStock(idx, rows, stores));
   }],
   ["GET", /^\/carts\/stock\/branches$/, async (req, res, m, url) => {
     const rows = await stockRows(await authUser(req), url);
-    ok(res, STORES.map((s, i) => {
-      const stock = branchStock(i, rows);
+    const stores = await getActiveStores(q);
+    ok(res, stores.map((s, i) => {
+      const stock = branchStock(i, rows, stores);
       const availableItems = stock.items.filter((it) => it.sufficient).length;
       return {
         storeId: s.id, storeName: s.name, areaName: s.storeArea.name, address: s.address, branchCode: stock.branchCode,
@@ -844,12 +868,11 @@ const routes = [
     if (!rows) throw new HttpError(404, "Kecamatan tidak ditemukan. Coba cari dan pilih kecamatan lagi.");
     ok(res, [...rows].sort((a, b) => a.zip_code.localeCompare(b.zip_code)));
   }],
-  ["GET", /^\/address\/store$/, (req, res, m, url) => {
-    const q = (url.searchParams.get("search") || "").toLowerCase();
-    ok(res, STORES.filter((s) => `${s.name} ${s.address}`.toLowerCase().includes(q)));
+  ["GET", /^\/address\/store$/, async (req, res, m, url) => {
+    ok(res, await getActiveStores(q, url.searchParams.get("search") || ""));
   }],
-  ["GET", /^\/address\/payment$/, (req, res) => ok(res, PAYMENT_GROUPS)],
-  ["GET", /^\/topsell-area-postal\/check-postal-code-is-exist\/(\w+)$/, (req, res, m) => ok(res, isTopsellPostal(m[1]))],
+  ["GET", /^\/address\/payment$/, async (req, res) => ok(res, await getActivePaymentGroups(q))],
+  ["GET", /^\/topsell-area-postal\/check-postal-code-is-exist\/(\w+)$/, async (req, res, m) => ok(res, await isTopsellPostalDb(q, m[1]))],
 
   // --- ongkir
   ["GET", /^\/shippings\/methods$/, (req, res) => ok(res, SHIPPING_METHODS)],
@@ -867,7 +890,8 @@ const routes = [
     const b = await readBody(req);
     const type = url.searchParams.get("voucher_type");
     const subtotal = subtotalOf(await linesFromBody(user, b.data));
-    ok(res, voucherList(type, subtotal, b.shippingID, type === "shipping" ? [] : await myVouchers(user.id)));
+    const globalVouchers = await getActiveVouchers(q);
+    ok(res, voucherList(type, subtotal, b.shippingID, globalVouchers, type === "shipping" ? [] : await myVouchers(user.id)));
   }],
   ["POST", /^\/vouchers\/validate$/, async (req, res, m, url) => {
     const user = await authUser(req);
@@ -888,9 +912,11 @@ const routes = [
     const lines = await linesFromBody(user, b.cartItems);
     if (!lines.length) throw new HttpError(400, "Keranjang kosong atau item tidak ditemukan");
     const shipping = SHIPPING_METHODS.find((s) => s.id === b.shippingID);
-    const paymentMethod = PAYMENT_METHODS.find((p) => p.id === b.paymentMethodID);
+    const paymentGroups = await getActivePaymentGroups(q);
+    const paymentMethod = paymentGroups.flatMap((g) => g.paymentMethods).find((p) => p.id === b.paymentMethodID);
     if (!shipping || !paymentMethod) throw new HttpError(400, "Metode pengiriman/pembayaran tidak valid");
-    const area = shipping.id === PICKUP_ID ? STORES.find((s) => s.id === b.areaID) : null;
+    const stores = shipping.id === PICKUP_ID ? await getActiveStores(q) : [];
+    const area = shipping.id === PICKUP_ID ? stores.find((s) => s.id === b.areaID) : null;
     if (shipping.id === PICKUP_ID && !area) throw new HttpError(400, "Pilih toko untuk Ambil di Toko");
 
     const subtotal = subtotalOf(lines);
@@ -943,9 +969,15 @@ const routes = [
         const used = await client.query(
           `update user_vouchers set used_at = now() where id = $1 and user_id = $2 and used_at is null`, [voucher.id, user.id]);
         if (!used.rowCount) throw new HttpError(400, "Voucher sudah dipakai");
+      } else if (voucher && !isUuid(voucher.id)) {
+        await client.query(`update admin_vouchers set used_qty = used_qty + 1 where id = $1`, [voucher.id]);
+      }
+      if (shipVoucher && !isUuid(shipVoucher.id)) {
+        await client.query(`update admin_vouchers set used_qty = used_qty + 1 where id = $1`, [shipVoucher.id]);
       }
     });
 
+    triggerWebhooks(q, "order.created", order);
     const redirectURL = paymentMethod.key === "manual" ? `/manual?inv=${invoice}`
       : paymentMethod.key === "qris" ? `/qr-payment?inv=${invoice}`
       : `/thankyou/${invoice}`;
@@ -1053,7 +1085,9 @@ const routes = [
   // --- poin
   ["GET", /^\/points\/balance$/, async (req, res) => {
     const user = await authUser(req);
-    ok(res, { userID: user.id, activePoints: user.points, expiringSoonPoints: 0, pointToRupiah: POINT_TO_RUPIAH });
+    const map = await getAppSettingsMap(q);
+    const pointToRupiah = Number(map.app_settings?.point_to_rupiah ?? POINT_TO_RUPIAH);
+    ok(res, { userID: user.id, activePoints: user.points, expiringSoonPoints: 0, pointToRupiah });
   }],
   // ponytail: poin lokal tidak kedaluwarsa; tambah tanggal kedaluwarsa per lot bila perlu diuji.
   ["GET", /^\/points\/expiring-soon$/, async (req, res) => {
@@ -1075,12 +1109,13 @@ const routes = [
   }],
   ["GET", /^\/points\/catalog$/, async (req, res) => {
     await authUser(req);
-    ok(res, REDEEM_CATALOG);
+    ok(res, await getActivePointCatalog(q));
   }],
   ["POST", /^\/points\/redeem$/, async (req, res) => {
     const user = await authUser(req);
     const { catalogID } = await readBody(req);
-    const item = REDEEM_CATALOG.find((c) => c.id === catalogID);
+    const catalog = await getActivePointCatalog(q);
+    const item = catalog.find((c) => c.id === catalogID);
     if (!item) throw new HttpError(404, "Katalog tidak ditemukan");
     const voucher = await tx(async (client) => {
       // Kunci baris user supaya dua penukaran bersamaan tidak memakai saldo yang sama.
@@ -1129,6 +1164,10 @@ const routes = [
     if (!row) throw new HttpError(400, "Link validasi tidak valid atau sudah dipakai");
     ok(res, null, "Email berhasil divalidasi");
   }],
+  ...buildAdminRoutes({
+    q, tx, ok, send, readBody, HttpError, DEV_MODE, ORDER_STATUS_SQL,
+    POINTS_SQL, PICKUP_ID, BITESHIP_KEY, TRACKING_URL, bookShipment,
+  }),
 ];
 
 const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest();
